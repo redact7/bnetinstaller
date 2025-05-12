@@ -81,11 +81,13 @@ fn get_file_path<P: AsRef<Path>>(
 fn main() {
     let args = Args::parse();
 
+    /* let agent deal with it
     let path: &Path = args.dir.as_ref();
     if !(path.is_dir() || (!path.exists() && path.parent().map_or(false, |p| p.is_dir()))) {
         eprintln!("{} is not a valid directory", args.dir);
         return;
     }
+    */
 
     let directory_path = "C:\\ProgramData\\Battle.net\\Agent\\Agent.9124\\Logs";
     let string_to_look_for = "Agent-";
