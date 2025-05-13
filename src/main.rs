@@ -52,37 +52,63 @@ struct InstallProgress {
     progress: f32,
 }
 
-fn get_file_path<P: AsRef<Path>>(
-    dir_path: P,
-    string_to_contain: &str,
-) -> Result<Option<PathBuf>, io::Error> {
-    let mut files_with_metadata: Vec<(PathBuf, std::fs::Metadata)> = Vec::new();
+fn get_path<P: AsRef<Path>>(dir_path: P) -> Result<Vec<PathBuf>, io::Error> {
+    let mut files_with_created_time: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
+
     for entry in fs::read_dir(dir_path)? {
         let entry = entry?;
         let path = entry.path();
-        if path.is_file() {
-            let metadata = fs::metadata(&path)?;
-            files_with_metadata.push((path, metadata));
+        let metadata = fs::metadata(&path)?;
+        if let Ok(created) = metadata.created() {
+            files_with_created_time.push((path, created));
         }
     }
 
-    files_with_metadata.sort_by(|(_, a), (_, b)| {
-        b.created()
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-            .cmp(&a.created().unwrap_or(std::time::SystemTime::UNIX_EPOCH))
-    });
+    files_with_created_time.sort_by(|(_, a), (_, b)| b.cmp(a));
 
-    for (file_path, _) in files_with_metadata {
-        if let Some(file_name) = file_path.file_name() {
-            if let Some(file_name_str) = file_name.to_str() {
-                if file_name_str.contains(string_to_contain) {
-                    return Ok(Some(file_path));
+    let sorted_paths: Vec<PathBuf> = files_with_created_time
+        .into_iter()
+        .map(|(path, _)| path)
+        .collect();
+
+    Ok(sorted_paths)
+}
+
+fn find_directory<'a, I>(paths: I, string_to_contain: &str) -> Option<PathBuf>
+where
+    I: IntoIterator<Item = &'a PathBuf>,
+{
+    for path in paths {
+        if path.is_dir() {
+            if let Some(name) = path.file_name() {
+                if let Some(name_str) = name.to_str() {
+                    if name_str.contains(string_to_contain) {
+                        return Some(path.clone());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn find_file<'a, I>(paths: I, string_to_contain: &str) -> Option<PathBuf>
+where
+    I: IntoIterator<Item = &'a PathBuf>,
+{
+    for path in paths {
+        if path.is_file() {
+            if let Some(name) = path.file_name() {
+                if let Some(name_str) = name.to_str() {
+                    if name_str.contains(string_to_contain) {
+                        return Some(path.clone());
+                    }
                 }
             }
         }
     }
 
-    Ok(None)
+    None
 }
 
 fn main() {
@@ -96,15 +122,29 @@ fn main() {
     }
     */
 
-    let directory_path = "C:\\ProgramData\\Battle.net\\Agent\\Agent.9124\\Logs";
-    let string_to_look_for = "Agent-";
+    let mut directory_path: PathBuf = PathBuf::from("C:\\ProgramData\\Battle.net\\Agent"); //\\Agent.9124\\Logs";
+    match get_path(&directory_path) {
+        Ok(paths) => match find_directory(&paths, "Agent") {
+            Some(agent_folder_path) => {
+                directory_path = agent_folder_path;
+                directory_path.push("Logs");
+                //println!("Successfully constructed log path: {:?}", directory_path);
+            }
+            None => {
+                eprintln!("Could not find agent folder.");
+            }
+        },
+        Err(err) => {
+            eprintln!("Error finding agent directory: {}", err);
+        }
+    }
 
     let port = fs::read_to_string("C:\\ProgramData\\Battle.net\\Agent\\Agent.dat").unwrap();
     let auth: String;
     //let pid: String;
 
-    match get_file_path(directory_path, string_to_look_for) {
-        Ok(file_path) => match file_path {
+    match get_path(directory_path) {
+        Ok(paths) => match find_file(&paths, "Agent-") {
             Some(file_path) => {
                 let auth_re = Regex::new(r"authorization.: .(\d*)").unwrap();
                 //let pid_re = Regex::new(r"pid.: (\d*)").unwrap();
@@ -133,7 +173,7 @@ fn main() {
             }
         },
         Err(err) => {
-            eprintln!("Error finding files: {}", err);
+            eprintln!("Error finding log files: {}", err);
             return;
         }
     }
