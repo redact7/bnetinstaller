@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
 
 #[derive(Parser, Debug)]
 #[command(long_about = None)]
@@ -43,6 +45,11 @@ struct InstallFinal {
     language: Vec<String>,
     selected_asset_locale: String,
     selected_locale: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct InstallProgress {
+    progress: f32,
 }
 
 fn get_file_path<P: AsRef<Path>>(
@@ -103,10 +110,17 @@ fn main() {
                 //let pid_re = Regex::new(r"pid.: (\d*)").unwrap();
                 let log_file = fs::read_to_string(&file_path).unwrap();
 
-                let auth_cap = auth_re.captures(&log_file).unwrap();
+                let auth_cap = auth_re.captures_iter(&log_file); //.unwrap();
                 //let pid_re = pid_re.captures(&log_file).unwrap();
 
-                auth = (&auth_cap[1]).to_string();
+                // idk rust very well, but surely this is normal right
+                auth = auth_cap
+                    .last()
+                    .unwrap()
+                    .get(1)
+                    .unwrap()
+                    .as_str()
+                    .to_string();
                 //pid = (&pid_re[1]).to_string();
 
                 println!("Found log file: {}", file_path.display());
@@ -127,8 +141,8 @@ fn main() {
     let mut headers = HeaderMap::new();
     headers.insert(USER_AGENT, HeaderValue::from_static("pheonix-agent/1.0"));
     headers.insert("Authorization", HeaderValue::from_str(&auth).unwrap());
-	//println!("{:?}", headers);
-	
+    //println!("{:?}", headers);
+
     let install_data = InstallData {
         instructions_patch_url: format!("http://us.patch.battle.net:1119/{}", args.prod.clone()),
         instructions_product: "NGDP".to_string(),
@@ -159,12 +173,16 @@ fn main() {
     if res {
         println!("Successful setup install request.");
     } else {
-		eprintln!("Unsuccessful setup install request.");
-		return
-	}
+        eprintln!("Unsuccessful setup install request.");
+        return;
+    }
 
     let res = client
-        .post(format!("http://127.0.0.1:{}/install/{}", port, args.prod.clone()))
+        .post(format!(
+            "http://127.0.0.1:{}/install/{}",
+            port,
+            args.prod.clone()
+        ))
         .headers(headers.clone())
         .body(serde_json::to_string(&install_final).unwrap())
         .send()
@@ -174,9 +192,30 @@ fn main() {
     if res {
         println!("Successful finalize install request.")
     } else {
-		eprintln!("Unsuccessful finalize install request.");
-		return
-	}
+        eprintln!("Unsuccessful finalize install request.");
+        return;
+    }
 
-    println!("Done... install started your battle.net client will reflect the install shortly.");
+    //println!("Done... install started your battle.net client will reflect the install shortly.");
+    loop {
+        let res = client
+            .get(format!(
+                "http://127.0.0.1:{}/install/{}",
+                port,
+                args.prod.clone()
+            ))
+            .headers(headers.clone())
+            .send()
+            .expect("Could not get install progress.");
+        if res.status().is_success() {
+            let progress: InstallProgress =
+                serde_json::from_slice::<InstallProgress>(res.text().unwrap().as_ref()).unwrap();
+            println!("Install progress: {}%", progress.progress * 100.0);
+        } else {
+            eprintln!("Unsuccessful install progress request.");
+            return;
+        }
+
+        thread::sleep(Duration::from_secs(2));
+    }
 }
