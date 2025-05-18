@@ -146,6 +146,8 @@ fn main() {
     match get_path(directory_path) {
         Ok(paths) => match find_file(&paths, "Agent-") {
             Some(file_path) => {
+                println!("Found log file: {}", file_path.display());
+
                 let auth_re = Regex::new(r"authorization.: .(\d*)").unwrap();
                 //let pid_re = Regex::new(r"pid.: (\d*)").unwrap();
                 let log_file = fs::read_to_string(&file_path).unwrap();
@@ -156,14 +158,13 @@ fn main() {
                 // idk rust very well, but surely this is normal right
                 auth = auth_cap
                     .last()
-                    .unwrap()
+                    .unwrap_or_else(|| panic!("Could not find authorization, {:?}", &log_file))
                     .get(1)
                     .unwrap()
                     .as_str()
                     .to_string();
                 //pid = (&pid_re[1]).to_string();
 
-                println!("Found log file: {}", file_path.display());
                 println!("Authorization: {}", auth);
                 //println!("PID: {}", pid);
             }
