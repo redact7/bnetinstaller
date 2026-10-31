@@ -6,7 +6,47 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
+use std::os::windows::process::CommandExt;
 use windows::{Win32::Foundation::*, Win32::System::Diagnostics::ToolHelp::*, core::*};
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+#[derive(Debug, Deserialize)]
+struct InstallResponse {
+    form: Form,
+    response_uri: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct Form {
+    authentication: ErrorOnly,
+    eula: ErrorOnly,
+    game_dir: GameDir,
+    language: ErrorOnly,
+    min_spec: ErrorOnly,
+    tome_path: ErrorOnly,
+}
+
+#[derive(Debug, Deserialize)]
+struct ErrorOnly {
+    error: i32,
+}
+
+#[derive(Debug, Deserialize)]
+struct GameDir {
+    default: String,
+    dirname: String,
+    error: i32,
+    game_dir: String,
+    required_space: u64,
+    required_space_info: RequiredSpaceInfo,
+    warning: i32,
+}
+
+#[derive(Debug, Deserialize)]
+struct RequiredSpaceInfo {
+    size: u64,
+    state: i32,
+}
 
 #[derive(Parser, Debug)]
 #[command(long_about = None)]
@@ -79,28 +119,6 @@ fn get_created_latest<P: AsRef<Path>>(dir_path: P) -> Result<Vec<PathBuf>> {
     Ok(sorted_paths)
 }
 
-fn get_modified_latest<P: AsRef<Path>>(dir_path: P) -> Result<Vec<PathBuf>> {
-    let mut files_with_modified_time: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
-
-    for entry in fs::read_dir(dir_path)? {
-        let entry = entry?;
-        let path = entry.path();
-        let metadata = fs::metadata(&path)?;
-        if let Ok(modified) = metadata.modified() {
-            files_with_modified_time.push((path, modified));
-        }
-    }
-
-    files_with_modified_time.sort_by(|(_, a), (_, b)| b.cmp(a));
-
-    let sorted_paths: Vec<PathBuf> = files_with_modified_time
-        .into_iter()
-        .map(|(path, _)| path)
-        .collect();
-
-    Ok(sorted_paths)
-}
-
 fn find_directory<'a, I>(paths: I, string_to_contain: &str) -> Option<PathBuf>
 where
     I: IntoIterator<Item = &'a PathBuf>,
@@ -119,67 +137,26 @@ where
     None
 }
 
-fn find_file<'a, I>(paths: I, string_to_contain: &str) -> Option<PathBuf>
-where
-    I: IntoIterator<Item = &'a PathBuf>,
-{
-    for path in paths {
-        if path.is_file() {
-            if let Some(name) = path.file_name() {
-                if let Some(name_str) = name.to_str() {
-                    if name_str.contains(string_to_contain) {
-                        return Some(path.clone());
-                    }
-                }
-            }
-        }
+fn get_agent_pid(agent_path: PathBuf) -> Option<u32> {
+    let sys = sysinfo::System::new_all().unwrap();
+    let agent_open = sys.processes_by_exact_name("Agent.exe".as_ref()).next();
+
+    let pid;
+    match agent_open {
+        Some(proc) => pid = proc.pid().as_u32(),
+        Option::None => {
+            let agent = std::process::Command::new(&agent_path).creation_flags(CREATE_NO_WINDOW).spawn().expect("Failed to start Battle.net Agent. Make sure Battle.net is running.");
+            pid = agent.id();
+        },
     }
 
-    None
+    Some(pid)
 }
 
-fn get_pid_from_exe(exe_name: &str) -> Option<u32> {
-    let mut pid: Option<u32> = None;
-    let mut pe32: PROCESSENTRY32 = unsafe { std::mem::zeroed() };
-    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }.unwrap();
-    if snapshot.is_invalid() {
-        println!("Error creating snapshot: {:?}", unsafe { GetLastError() });
-        return None;
-    }
-
-    pe32.dwSize = size_of::<PROCESSENTRY32>() as u32;
-    if unsafe { Process32First(snapshot, &mut pe32).is_err() } {
-        println!("Error retrieving first process information: {:?}", unsafe {
-            GetLastError()
-        });
-    }
-
-    loop {
-        let current_exe =
-            unsafe { std::ffi::CStr::from_ptr(pe32.szExeFile.as_ptr()).to_string_lossy() };
-        //println!("{}", current_exe);
-
-        if current_exe.eq_ignore_ascii_case(exe_name) {
-            pid = Some(pe32.th32ProcessID);
-            //println!("{:?}", pid);
-            break;
-        }
-
-        if unsafe { Process32Next(snapshot, &mut pe32) }.is_err() {
-            break;
-        }
-    }
-
-    unsafe {
-        let _ = CloseHandle(snapshot);
-    };
-    pid
-}
-
-fn force_authorization(pid: &str, port: &str) -> Option<String> {
+fn get_authorization(pid: u32, port: &str) -> Option<String> {
     let mut headers = HeaderMap::new();
     headers.insert(USER_AGENT, HeaderValue::from_static("pheonix-agent/1.0"));
-    headers.insert("pid", HeaderValue::from_str(&pid).unwrap());
+    headers.insert("pid", HeaderValue::from_str(&pid.to_string()).unwrap());
 
     let client = reqwest::blocking::Client::new();
     let res = client
@@ -201,23 +178,13 @@ fn force_authorization(pid: &str, port: &str) -> Option<String> {
 
 fn main() {
     let args = Args::parse();
-    let mut force_auth = false;
 
-    /* let agent deal with it
-    let path: &Path = args.dir.as_ref();
-    if !(path.is_dir() || (!path.exists() && path.parent().map_or(false, |p| p.is_dir()))) {
-        eprintln!("{} is not a valid directory", args.dir);
-        return;
-    }
-    */
-
-    let mut directory_path: PathBuf = PathBuf::from("C:\\ProgramData\\Battle.net\\Agent"); //\\Agent.9124\\Logs";
-    match get_created_latest(&directory_path) {
+    let mut agent_path: PathBuf = PathBuf::from("C:\\ProgramData\\Battle.net\\Agent"); //\\Agent.9124\\Logs";
+    match get_created_latest(&agent_path) {
         Ok(paths) => match find_directory(&paths, "Agent") {
             Some(agent_folder_path) => {
-                directory_path = agent_folder_path;
-                directory_path.push("Logs");
-                //println!("Successfully constructed log path: {:?}", directory_path);
+                agent_path = agent_folder_path;
+                agent_path.push("Agent.exe")
             }
             None => {
                 eprintln!("Could not find agent folder.");
@@ -229,61 +196,12 @@ fn main() {
     }
 
     let port = fs::read_to_string("C:\\ProgramData\\Battle.net\\Agent\\Agent.dat").unwrap();
-    let auth: String;
-    let pid: String = get_pid_from_exe("battle.net.exe").unwrap().to_string();
-
-    match get_modified_latest(directory_path) {
-        Ok(paths) => match find_file(&paths, "Agent-") {
-            Some(file_path) => {
-                println!("Found log file: {}", file_path.display());
-
-                let auth_re = Regex::new(r"authorization.: .(\d*)").unwrap();
-                //let pid_re = Regex::new(r"pid.: (\d*)").unwrap();
-                let log_file = fs::read_to_string(&file_path).unwrap();
-
-                let auth_cap = auth_re.captures_iter(&log_file); //.unwrap();
-                //let pid_re = pid_re.captures(&log_file).unwrap();
-
-                // idk rust very well, but surely this is normal right
-                // auth = auth_cap
-                //     .last()
-                //     .unwrap_or_else(|| panic!("Could not find authorization, {:?}", &log_file))
-                //     .get(1)
-                //     .unwrap()
-                //     .as_str()
-                //     .to_string();
-                //
-                match auth_cap.last() {
-                    Some(v) => {
-                        auth = v.get(1).unwrap().as_str().to_string();
-                    }
-                    None => {
-                        println!("Could not find auth in log file forcing authorization.");
-                        println!("PID: {}", pid);
-                        force_auth = true;
-                        auth = force_authorization(&pid, &port).expect("Invalid /agent authorization.");
-                    }
-                }
-
-                //pid = (&pid_re[1]).to_string();
-                println!("Authorization: {}", auth);
-                //println!("PID: {}", pid);
-            }
-            None => {
-                eprintln!("Could not find log file.");
-                return;
-            }
-        },
-        Err(err) => {
-            eprintln!("Error finding log files: {}", err);
-            return;
-        }
-    }
+    let pid = get_agent_pid(agent_path).unwrap();
+    let auth = get_authorization(pid, &port).unwrap();
 
     let mut headers = HeaderMap::new();
     headers.insert(USER_AGENT, HeaderValue::from_static("pheonix-agent/1.0"));
     headers.insert("Authorization", HeaderValue::from_str(&auth).unwrap());
-    //println!("{:?}", headers);
 
     let install_data = InstallData {
         instructions_patch_url: format!("http://us.patch.battle.net:1119/{}", args.prod.clone()),
@@ -319,10 +237,6 @@ fn main() {
         return;
     }
 
-    if force_auth {
-        headers.insert("Authorization", HeaderValue::from_str(&force_authorization(&pid, &port).unwrap().to_string()).unwrap());
-        println!("Authorization: {}", auth);
-    }
     let res = client
         .post(format!(
             "http://127.0.0.1:{}/install/{}",
@@ -343,16 +257,6 @@ fn main() {
     }
 
     loop {
-        if force_auth
-        {
-            println!("Done! The game is ready to download, restart battle.net to see it's progress.");
-            break;
-        }
-           
-        // if force_auth {
-        //     headers.insert("Authorization", HeaderValue::from_str(&force_authorization(&pid, &port).unwrap().to_string()).unwrap());
-        //     println!("Authorization: {}", auth);
-        // }
         let res = client
             .get(format!(
                 "http://127.0.0.1:{}/install/{}",
