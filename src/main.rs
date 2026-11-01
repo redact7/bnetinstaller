@@ -1,5 +1,4 @@
 use clap::Parser;
-use regex::Regex;
 use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -7,13 +6,13 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 use std::os::windows::process::CommandExt;
-use windows::{Win32::Foundation::*, Win32::System::Diagnostics::ToolHelp::*, core::*};
+use windows::{core::*};
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 #[derive(Debug, Deserialize)]
 struct InstallResponse {
     form: Form,
-    response_uri: String,
+    // response_uri: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -33,18 +32,18 @@ struct ErrorOnly {
 
 #[derive(Debug, Deserialize)]
 struct GameDir {
-    default: String,
-    dirname: String,
+    // default: String,
+    // dirname: String,
     error: i32,
-    game_dir: String,
-    required_space: u64,
+    // game_dir: String,
+    // required_space: i64,
     required_space_info: RequiredSpaceInfo,
-    warning: i32,
+    // warning: i32,
 }
 
 #[derive(Debug, Deserialize)]
 struct RequiredSpaceInfo {
-    size: u64,
+    // size: i64,
     state: i32,
 }
 
@@ -54,6 +53,10 @@ struct Args {
     /// TACT Product
     #[arg(short, long)]
     prod: String,
+
+    /// Agent UID
+    #[arg(short, long)]
+    uid: Option<String>,
 
     /// Game/Asset language
     #[arg(short, long)]
@@ -166,7 +169,7 @@ fn get_authorization(pid: u32, port: &str) -> Option<String> {
         .expect("Failed to send /agent request... is your battle.net open?");
 
     if res.status().is_success() {
-        println!("Successful /agent request");
+        println!("Succesfully authorized with Battle.net Agent.");
     } else {
         eprintln!("Unsuccessful /agent request: {:?}", res);
         return None;
@@ -176,10 +179,23 @@ fn get_authorization(pid: u32, port: &str) -> Option<String> {
     Some(agent_data.authorization)
 }
 
+fn error_code_to_support_article(code: i32, locale: &str) -> String {
+    format!("http://nydus.battle.net/App/{locale}/setup/error/BLZBNTAGT{code:08X}")
+}
+
+fn check_agent_error(error: i32) -> bool {
+    if error != 0 {
+        eprintln!("Battle.net Agent error: {}", error_code_to_support_article(error, "enUS"));
+        false
+    } else {
+        true
+    }
+}
+
 fn main() {
     let args = Args::parse();
 
-    let mut agent_path: PathBuf = PathBuf::from("C:\\ProgramData\\Battle.net\\Agent"); //\\Agent.9124\\Logs";
+    let mut agent_path: PathBuf = PathBuf::from("C:\\ProgramData\\Battle.net\\Agent");
     match get_created_latest(&agent_path) {
         Ok(paths) => match find_directory(&paths, "Agent") {
             Some(agent_folder_path) => {
@@ -204,7 +220,7 @@ fn main() {
     headers.insert("Authorization", HeaderValue::from_str(&auth).unwrap());
 
     let install_data = InstallData {
-        instructions_patch_url: format!("http://us.patch.battle.net:1119/{}", args.prod.clone()),
+        instructions_patch_url: format!("http://us.patch.battle.net:1119/{}", args.uid.as_deref().unwrap_or(&args.prod)),
         instructions_product: "NGDP".to_string(),
         priority: Priority {
             insert_at_head: true,
@@ -213,9 +229,9 @@ fn main() {
         uid: args.prod.clone(),
     };
 
-    let install_final = InstallFinal {
-        finalized: true,
-        game_dir: args.dir,
+    let install_loop = InstallFinal {
+        finalized: false,
+        game_dir: args.dir.clone(),
         language: vec![args.lang.clone()],
         selected_asset_locale: args.lang.clone(),
         selected_locale: args.lang.clone(),
@@ -231,28 +247,68 @@ fn main() {
         .status()
         .is_success();
     if res {
-        println!("Successful setup install request.");
+        println!("Preparing to install.");
     } else {
         eprintln!("Unsuccessful setup install request.");
         return;
     }
 
+    loop {
+        let res = client
+            .post(format!(
+                "http://127.0.0.1:{}/install/{}",
+                port,
+                args.prod.clone()
+            ))
+            .headers(headers.clone())
+            .body(serde_json::to_string(&install_loop).unwrap())
+            .send()
+            .expect("Failed to send start install request... is your battle.net open?");
+        if res.status().is_success() {
+            let response = serde_json::from_slice::<InstallResponse>(res.text().unwrap().as_ref()).unwrap().form;
+
+            if !check_agent_error(response.authentication.error) {break};
+            if !check_agent_error(response.eula.error) {break};
+            if !check_agent_error(response.language.error) {break};
+            if !check_agent_error(response.min_spec.error) {break};
+            if !check_agent_error(response.tome_path.error) {break};
+            
+            let progress = response.game_dir.required_space_info.state;
+            if progress == 1009 { // TODO: 1009 should mean that the storage space calculation is finished. 1005 should mean in progress
+                if check_agent_error(response.game_dir.error) {
+                    break;
+                } else {
+                    return;
+                }
+            }
+        } else {
+            eprintln!("Unsuccessful loop install request.");
+            return;
+        }
+
+        thread::sleep(Duration::from_secs(1));
+    }
+
+    let install_final = InstallFinal {
+        finalized: true,
+        game_dir: args.dir,
+        language: vec![args.lang.clone()],
+        selected_asset_locale: args.lang.clone(),
+        selected_locale: args.lang.clone(),
+    };
+
     let res = client
-        .post(format!(
-            "http://127.0.0.1:{}/install/{}",
-            port,
-            args.prod.clone()
-        ))
+        .post(format!("http://127.0.0.1:{}/install/{}", port, args.prod.clone()))
         .headers(headers.clone())
         .body(serde_json::to_string(&install_final).unwrap())
         .send()
-        .expect("Failed to send start install request... is your battle.net open?")
+        .expect("Failed to send setup install request... is your battle.net open?")
         .status()
         .is_success();
     if res {
-        println!("Successful finalize install request.")
+        println!("Starting install.");
     } else {
-        eprintln!("Unsuccessful finalize install request.");
+        eprintln!("Unsuccessful final install request.");
         return;
     }
 
